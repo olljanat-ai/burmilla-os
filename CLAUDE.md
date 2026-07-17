@@ -324,12 +324,15 @@ Decided 3.x scope (cgroups):
    - `console_init.go` (`setupConsoleCgroups`): the user Docker daemon is
      exec'd into the console mount namespace (`startDocker` in
      `user_docker.go`), and Docker enables v2 mode only when
-     `/sys/fs/cgroup` itself is a cgroup2 mount. When the v2 hierarchy has
-     controllers, console-init mounts cgroup2 over `/sys/fs/cgroup` in the
-     console namespace, so **User Docker runs in cgroup v2 mode with working
-     resource limits** (cgroupfs driver — no systemd present). The host
-     namespace and System Docker are untouched. Without v2 controllers it
-     falls back to the old v1 + `name=systemd` layout.
+     `/sys/fs/cgroup` itself is a cgroup2 mount. When v2 controllers are
+     available (detected from `/proc/cgroups` hierarchy ID 0 — no probe
+     mount needed), console-init recursively detaches the tmpfs + v1 bind
+     mounts System Docker created for the container and mounts a single
+     clean cgroup2 at `/sys/fs/cgroup`, so **User Docker runs in cgroup v2
+     mode with working resource limits** (cgroupfs driver — no systemd
+     present) and the console mount table shows exactly one cgroup entry.
+     The host namespace and System Docker are untouched. Without v2
+     controllers it falls back to the old v1 + `name=systemd` layout.
    - Kernel cmdline **`rancher.cgroups.legacy`** restores the all-v1 behavior
      end-to-end (console auto-detects the empty v2 controller list).
    - Accepted trade-offs: system containers get no cpu/memory limits, stats
