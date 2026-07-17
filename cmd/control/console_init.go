@@ -39,6 +39,77 @@ type symlink struct {
 	oldname, newname string
 }
 
+// hasCgroupV2Controllers reports whether any enabled cgroup controller is
+// left off the v1 hierarchies (hierarchy ID 0 in /proc/cgroups). PID1's
+// controller split (see cgroupV1Controllers in pkg/dfs) leaves everything
+// User Docker needs on the v2 unified hierarchy; with
+// rancher.cgroups.legacy every controller is mounted on v1 and this
+// returns false.
+func hasCgroupV2Controllers() bool {
+	data, err := ioutil.ReadFile("/proc/cgroups")
+	if err != nil {
+		log.Error(err)
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) < 4 {
+			continue
+		}
+		if fields[1] == "0" && fields[3] != "0" {
+			return true
+		}
+	}
+	return false
+}
+
+// setupConsoleCgroups prepares the cgroup mounts of the console mount
+// namespace. The user Docker daemon is exec'd into this namespace (see
+// startDocker in user_docker.go) and Docker enables cgroup v2 mode only when
+// /sys/fs/cgroup itself is a cgroup2 mount. PID1 keeps the controllers that
+// System Docker 17.06 requires on v1 hierarchies and leaves the rest to the
+// v2 unified hierarchy; when v2 controllers are available, the tmpfs and
+// cgroup v1 bind mounts System Docker created for this container are
+// detached and replaced with a single cgroup2 mount, so User Docker uses
+// cgroup v2. The host mount namespace, and with it System Docker, is not
+// affected. Without v2 controllers (rancher.cgroups.legacy or a v1-only
+// kernel) the console keeps the classic v1 layout with the named systemd
+// hierarchy.
+func setupConsoleCgroups() {
+	var st unix.Statfs_t
+	if err := unix.Statfs("/sys/fs/cgroup", &st); err != nil {
+		log.Error(err)
+		return
+	}
+	if st.Type == unix.CGROUP2_SUPER_MAGIC {
+		// already switched (console restart)
+		return
+	}
+
+	if hasCgroupV2Controllers() {
+		// recursively detach the container's tmpfs with its v1 binds
+		// (System Docker's view - nothing in this namespace needs it)
+		if err := unix.Unmount("/sys/fs/cgroup", unix.MNT_DETACH); err != nil {
+			log.Error(err)
+		}
+		if err := unix.Mount("cgroup2", "/sys/fs/cgroup", "cgroup2",
+			unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC|unix.MS_RELATIME, ""); err != nil {
+			log.Error(err)
+		}
+	} else {
+		// mount systemd cgroups
+		if err := os.MkdirAll("/sys/fs/cgroup/systemd", 0555); err != nil {
+			log.Error(err)
+		}
+		if err := unix.Mount("cgroup", "/sys/fs/cgroup/systemd", "cgroup", 0, "none,name=systemd"); err != nil {
+			log.Error(err)
+		}
+	}
+}
+
 func consoleInitAction(c *cli.Context) error {
 	return consoleInitFunc()
 }
@@ -225,13 +296,7 @@ $(tput sgr0)
 		}
 	}
 
-	// mount systemd cgroups
-	if err := os.MkdirAll("/sys/fs/cgroup/systemd", 0555); err != nil {
-		log.Error(err)
-	}
-	if err := unix.Mount("cgroup", "/sys/fs/cgroup/systemd", "cgroup", 0, "none,name=systemd"); err != nil {
-		log.Error(err)
-	}
+	setupConsoleCgroups()
 
 	// font backslashes need to be escaped for when issue is output! (but not the others..)
 	if err := ioutil.WriteFile("/etc/issue", []byte(config.Banner), 0644); err != nil {

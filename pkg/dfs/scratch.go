@@ -25,6 +25,10 @@ const (
 	iptables      = "/sbin/iptables"
 	modprobe      = "/sbin/modprobe"
 	distSuffix    = ".dist"
+	// cgroup v2 mount point in the hybrid layout: v1 controller hierarchies
+	// stay at /sys/fs/cgroup/<controller> for System Docker, the unified
+	// hierarchy is available next to them for software that supports it.
+	cgroupV2Path = "/sys/fs/cgroup/unified"
 )
 
 var (
@@ -38,6 +42,32 @@ var (
 		{"none", "/sys", "sysfs", ""},
 		{"none", "/sys/fs/cgroup", "tmpfs", ""},
 		{"debugfs", "/sys/kernel/debug", "debugfs", ""},
+	}
+
+	// Controllers kept on cgroup v1 hierarchies for System Docker 17.06.
+	// A controller can only be active on one hierarchy at a time, so every
+	// controller mounted on v1 is lost to the v2 unified hierarchy. This set
+	// is therefore kept minimal:
+	//   - devices: hard requirement of System Docker's 2017-era libcontainer
+	//     (a missing devices hierarchy fails every container start). It has
+	//     no cgroup v2 controller equivalent (v2 uses eBPF programs), so
+	//     keeping it on v1 costs the v2 side nothing.
+	//   - freezer: used for pause/kill; freezing is core cgroup v2
+	//     functionality (cgroup.freeze), not a controller, so no conflict.
+	//   - net_cls, net_prio, perf_event: never became v2 controllers.
+	// Everything else (cpu, cpuacct, cpuset, memory, blkio, pids, hugetlb,
+	// rdma, misc) is left unmounted on v1 so the kernel keeps it available
+	// on the cgroup v2 unified hierarchy for User Docker. System Docker
+	// tolerates these being absent: its libcontainer skips missing
+	// hierarchies (only devices is fatal) and containerd only logs the
+	// failed OOM-monitor setup. The cost is no resource limits/stats and no
+	// OOM events for system containers - they run unlimited anyway.
+	cgroupV1Controllers = map[string]bool{
+		"devices":    true,
+		"freezer":    true,
+		"net_cls":    true,
+		"net_prio":   true,
+		"perf_event": true,
 	}
 )
 
@@ -84,6 +114,17 @@ func createDirs(dirs ...string) error {
 	return nil
 }
 
+// cgroupsLegacyV1 reports whether the kernel command line requests the
+// pre-3.x behavior of mounting every controller on cgroup v1
+// (rancher.cgroups.legacy). The v2 hierarchy is then still mounted but has
+// no controllers, and the console keeps its v1 layout.
+func cgroupsLegacyV1() bool {
+	if v, ok := cmdline.GetCmdline("rancher.cgroups.legacy").(bool); ok {
+		return v
+	}
+	return false
+}
+
 func mountCgroups(hierarchyConfig map[string]string) error {
 	f, err := os.Open("/proc/cgroups")
 	if err != nil {
@@ -94,6 +135,7 @@ func mountCgroups(hierarchyConfig map[string]string) error {
 	scanner := bufio.NewScanner(f)
 
 	hierarchies := make(map[string][]string)
+	legacy := cgroupsLegacyV1()
 
 	for scanner.Scan() {
 		text := scanner.Text()
@@ -101,6 +143,11 @@ func mountCgroups(hierarchyConfig map[string]string) error {
 		fields := strings.Split(text, "\t")
 		cgroup := fields[0]
 		if cgroup == "" || cgroup[0] == '#' || (len(fields) > 3 && fields[3] == "0") {
+			continue
+		}
+
+		if !legacy && !cgroupV1Controllers[cgroup] {
+			log.Debugf("cgroup controller %s left to the v2 unified hierarchy", cgroup)
 			continue
 		}
 
@@ -118,7 +165,9 @@ func mountCgroups(hierarchyConfig map[string]string) error {
 
 	for _, hierarchy := range hierarchies {
 		if err := mountCgroup(strings.Join(hierarchy, ",")); err != nil {
-			return err
+			// A controller may exist without v1 support (e.g. built with
+			// CONFIG_MEMCG_V1=n); it is then only usable via cgroup v2 below
+			log.Errorf("Failed to mount cgroup hierarchy %s: %v", strings.Join(hierarchy, ","), err)
 		}
 	}
 
@@ -126,8 +175,24 @@ func mountCgroups(hierarchyConfig map[string]string) error {
 		return err
 	}
 
+	if err := mountCgroupV2(); err != nil {
+		log.Errorf("Failed to mount cgroup2 to %s: %v", cgroupV2Path, err)
+	}
+
 	log.Debug("Done mouting cgroupfs")
 	return nil
+}
+
+// mountCgroupV2 mounts the cgroup v2 unified hierarchy beside the v1
+// controller hierarchies (systemd-style "hybrid" layout). Controllers that
+// are mounted on a v1 hierarchy stay there, so System Docker keeps working,
+// while v2-aware software can use the unified hierarchy.
+func mountCgroupV2() error {
+	if err := createDirs(cgroupV2Path); err != nil {
+		return err
+	}
+
+	return createMounts([][]string{{"cgroup2", cgroupV2Path, "cgroup2", "rw,nosuid,nodev,noexec,relatime,nsdelegate"}}...)
 }
 
 func CreateSymlinks(pathSets [][]string) error {
