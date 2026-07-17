@@ -384,6 +384,21 @@ Decided 3.x scope (cgroups):
    there) and user workloads already run under user Docker's own bundled
    modern runc — the real value is a maintained runtime on the 6.12 kernel
    and CVE hygiene.
+   **crun alternative** (evaluated against its sources): mostly a drop-in for
+   this stack too — `create/start/exec/delete/kill/pause/resume/state` with
+   `--console-socket`/`--pid-file`/`--no-pivot`/`--log-format json` all
+   exist, cgroup v1 (`CGROUP_MODE_LEGACY`) is supported, no strict
+   `ociVersion` validation, and the static binary is ~10x smaller than
+   runc's (nice for a RAM-resident OS). Two gaps decide against it for the
+   17.06 pairing: crun has **no `events` subcommand**, and containerd 0.2.x
+   implements `Stats()` by shelling out to `runc events --stats`, so
+   `system-docker stats` would error instead of just missing cpu/mem
+   numbers; and crun documents no cgroup v1 support horizon (its home
+   ecosystem podman/RHEL has been v2-only for years, so v1 paths get little
+   testing) while runc commits to v1 until ≥ May 2029. Verdict: runc stays
+   the primary candidate here; revisit crun for the 3.1+ System Docker
+   replacement, where modern containerd reads cgroup stats directly (no
+   `events` needed) and crun's size advantage actually pays off.
 4. Start a parallel `os-system-docker` upgrade track (modern moby or plain
    containerd+nerdctl) targeting 3.1+: switch the primary `/sys/fs/cgroup`
    mount to cgroup2, remove the API-version downgrade hacks, and drop the
