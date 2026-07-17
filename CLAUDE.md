@@ -285,6 +285,19 @@ System Docker 17.06.107 is the highest-risk legacy piece. Facts found in review:
   Do not resurrect that approach while System Docker 17.06 is in use.
 - `os-services` already carries `DOCKER_MIN_API_VERSION=1.24` downgrade hacks so
   modern user-Docker CLIs can talk to the old System Docker.
+- The March 2023 `os-system-docker` `runc-v1.1.4-draft` branch (17.06.109) was
+  the runtime half of the same cgroup v2 experiment: 17.06's stock runc
+  (1.0.0-rc3 era, pin `5babf27`) has no cgroup v2 support at all (that landed
+  in runc 1.0.0-rc91, 2020), so a v2-capable runc was needed for the v2-only
+  layout. Swapping the runc binary alone cannot work, though: dockerd 17.06 and
+  its vendored 2017 libcontainer/containerd 0.2.x are cgroup-v1-hardwired
+  (v1 controller discovery via `/proc/self/mountinfo`, `pkg/sysinfo` checks,
+  v1-format `runc events` stats parsing), so system containers still fail on a
+  v2-only host and the system does not boot. The exact tested engine commit
+  (`e74492d4f`) was orphaned by a force-push of `release-v17.06-burmilla` the
+  next day, which reverted to the old runc pin. Conclusion: a newer runc under
+  System Docker 17.06 buys nothing — cgroup v2 support arrives only with the
+  full System Docker replacement (see below).
 
 Decided 3.x scope (cgroups):
 
