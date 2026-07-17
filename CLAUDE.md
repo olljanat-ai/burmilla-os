@@ -295,9 +295,11 @@ System Docker 17.06.107 is the highest-risk legacy piece. Facts found in review:
   v1-format `runc events` stats parsing), so system containers still fail on a
   v2-only host and the system does not boot. The exact tested engine commit
   (`e74492d4f`) was orphaned by a force-push of `release-v17.06-burmilla` the
-  next day, which reverted to the old runc pin. Conclusion: a newer runc under
-  System Docker 17.06 buys nothing — cgroup v2 support arrives only with the
-  full System Docker replacement (see below).
+  next day, which reverted to the old runc pin. Conclusion: the 2023 failure
+  was caused by the v2-only mount layout, not by runc 1.1.4 itself — no runc
+  version could have saved Docker 17.06 on that layout. Getting *cgroup v2*
+  needs the full System Docker replacement; but a newer runc on the v1/hybrid
+  layout is a different, viable story (see step 3 below).
 
 Decided 3.x scope (cgroups):
 
@@ -315,7 +317,45 @@ Decided 3.x scope (cgroups):
    boots. Note: controllers bound to a v1 hierarchy are not usable through the
    v2 hierarchy at the same time — full v2 resource control arrives only with
    the System Docker replacement.
-3. Start a parallel `os-system-docker` upgrade track (modern moby or plain
+3. **runc refresh under System Docker 17.06** (viable on the hybrid layout;
+   candidate for 3.0 or early 3.x): keep dockerd 17.06 + containerd 0.2.x as
+   the orchestrator but swap the `docker-runc`/`system-docker-runc` binary for
+   a current upstream runc, so the actual system containers run under a
+   maintained runtime. Code-level compatibility was verified in review:
+   - The containerd 0.2.x shim invokes runc only via CLI:
+     `create --bundle --console-socket --no-pivot --pid-file`,
+     `start`, `exec -d --process --console-socket --pid-file`, `delete -f`,
+     `kill`, `pause`/`resume`, `state`, `events --stats`. All of these exist
+     unchanged in current runc (checked against runc main, post-1.3).
+   - `--no-pivot` (needed because of `DOCKER_RAMDISK=true` on the initramfs
+     root) is still supported; `ros user-docker`'s direct
+     `system-docker-runc exec` call is plain CLI too.
+   - Stats: containerd parses `runc events --stats` `data.{cpu,memory,pids,
+     blkio,hugetlb}` — same shape modern runc emits for v1 cgroups. OOM
+     monitoring reads the v1 `memory.oom_control` eventfd directly, present in
+     the hybrid layout. `runc state` parsing needs only the `status` field.
+   - runc 1.1.4 was additionally checked: it does not reject Docker 17.06's
+     `ociVersion: 1.0.0-rc5-dev` specs (no version validation on load).
+   - Upstream runway: runc deprecates cgroup v1 in v1.4.0 but commits to a
+     maintained v1-capable branch until at least May 2029 (docs/deprecated.md)
+     — enough to bridge until the System Docker replacement.
+   Packaging: do NOT build runc with the 17.06-era moby scripts (modern runc
+   needs Go 1.23+ and libseccomp); instead have `os-system-docker` repackage
+   the official upstream static runc release binaries (amd64/arm64), or
+   Debian 13's runc once os-base is Debian-based, into the existing tgz under
+   the same binary name. This keeps the change a pure binary swap, trivially
+   revertable.
+   Known residual risks (need a qemu boot test, not more code review): the
+   pairing is untested upstream; interactive terminal behavior differs (the
+   17.06 runc carries the "Revert saneTerminal" ONLCR patch for old-client
+   attach compat — expect cosmetic staircase output in `docker exec -it`
+   against system containers); deprecation warnings on stderr; and `docker
+   stats` field drift is cosmetic-only. Note the security win is bounded:
+   system containers are privileged/trusted (runc escape CVEs matter little
+   there) and user workloads already run under user Docker's own bundled
+   modern runc — the real value is a maintained runtime on the 6.12 kernel
+   and CVE hygiene.
+4. Start a parallel `os-system-docker` upgrade track (modern moby or plain
    containerd+nerdctl) targeting 3.1+: switch the primary `/sys/fs/cgroup`
    mount to cgroup2, remove the API-version downgrade hacks, and drop the
    17.06-era vendored client pins in this repo. This is the single change that
