@@ -39,6 +39,59 @@ type symlink struct {
 	oldname, newname string
 }
 
+// setupConsoleCgroups prepares the cgroup mounts of the console mount
+// namespace. The user Docker daemon is exec'd into this namespace (see
+// startDocker in user_docker.go) and Docker enables cgroup v2 mode only when
+// /sys/fs/cgroup itself is a cgroup2 mount. PID1 keeps the controllers that
+// System Docker 17.06 requires on v1 hierarchies and leaves the rest to the
+// v2 unified hierarchy (see cgroupV1Controllers in pkg/dfs); when v2
+// controllers are available, cgroup2 is made the primary cgroup mount of
+// this namespace so User Docker uses cgroup v2. The host mount namespace,
+// and with it System Docker, is not affected. Without v2 controllers
+// (rancher.cgroups.legacy or a v1-only kernel) the console keeps the
+// classic v1 layout with the named systemd hierarchy.
+func setupConsoleCgroups() {
+	var st unix.Statfs_t
+	if err := unix.Statfs("/sys/fs/cgroup", &st); err != nil {
+		log.Error(err)
+		return
+	}
+	if st.Type == unix.CGROUP2_SUPER_MAGIC {
+		// already switched (console restart)
+		return
+	}
+
+	if err := os.MkdirAll("/sys/fs/cgroup/unified", 0555); err != nil {
+		log.Error(err)
+	}
+	if err := unix.Mount("cgroup2", "/sys/fs/cgroup/unified", "cgroup2", 0, ""); err != nil {
+		log.Error(err)
+	}
+
+	controllers, err := ioutil.ReadFile("/sys/fs/cgroup/unified/cgroup.controllers")
+	if err != nil {
+		log.Error(err)
+	}
+	if len(strings.TrimSpace(string(controllers))) > 0 {
+		// resource controllers live on v2: make it the primary cgroup
+		// mount of this namespace so User Docker picks cgroup v2
+		if err := unix.Unmount("/sys/fs/cgroup/unified", unix.MNT_DETACH); err != nil {
+			log.Error(err)
+		}
+		if err := unix.Mount("cgroup2", "/sys/fs/cgroup", "cgroup2", 0, ""); err != nil {
+			log.Error(err)
+		}
+	} else {
+		// mount systemd cgroups
+		if err := os.MkdirAll("/sys/fs/cgroup/systemd", 0555); err != nil {
+			log.Error(err)
+		}
+		if err := unix.Mount("cgroup", "/sys/fs/cgroup/systemd", "cgroup", 0, "none,name=systemd"); err != nil {
+			log.Error(err)
+		}
+	}
+}
+
 func consoleInitAction(c *cli.Context) error {
 	return consoleInitFunc()
 }
@@ -225,22 +278,7 @@ $(tput sgr0)
 		}
 	}
 
-	// mount systemd cgroups
-	if err := os.MkdirAll("/sys/fs/cgroup/systemd", 0555); err != nil {
-		log.Error(err)
-	}
-	if err := unix.Mount("cgroup", "/sys/fs/cgroup/systemd", "cgroup", 0, "none,name=systemd"); err != nil {
-		log.Error(err)
-	}
-
-	// mount the cgroup v2 unified hierarchy beside the v1 hierarchies
-	// (hybrid layout, same as PID1 does for the host in pkg/dfs)
-	if err := os.MkdirAll("/sys/fs/cgroup/unified", 0555); err != nil {
-		log.Error(err)
-	}
-	if err := unix.Mount("cgroup2", "/sys/fs/cgroup/unified", "cgroup2", 0, ""); err != nil {
-		log.Error(err)
-	}
+	setupConsoleCgroups()
 
 	// font backslashes need to be escaped for when issue is output! (but not the others..)
 	if err := ioutil.WriteFile("/etc/issue", []byte(config.Banner), 0644); err != nil {

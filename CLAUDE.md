@@ -306,17 +306,43 @@ Decided 3.x scope (cgroups):
 1. The 3.x kernel (6.12) is built with **both cgroup v1 and v2 enabled**
    (`CONFIG_MEMCG_V1=y` etc. — several v1 controllers are no longer default-on
    in 6.12).
-2. **Hybrid cgroup layout** (implemented on this branch): PID1 keeps mounting
-   the v1 controller hierarchies at `/sys/fs/cgroup/<controller>` (parsed from
-   `/proc/cgroups` in `pkg/dfs/scratch.go`) so System Docker 17.06 keeps
-   working, and additionally mounts the **cgroup v2 unified hierarchy at
-   `/sys/fs/cgroup/unified`** (systemd hybrid-mode convention).
-   `console_init.go` mounts the same unified hierarchy inside the console
-   container next to its `name=systemd` v1 mount. v1 hierarchy mount failures
-   are now non-fatal (logged) so a kernel lacking some v1 controller still
-   boots. Note: controllers bound to a v1 hierarchy are not usable through the
-   v2 hierarchy at the same time — full v2 resource control arrives only with
-   the System Docker replacement.
+2. **Controller-split hybrid layout** (implemented on this branch). A
+   controller can only be active on one hierarchy at a time, so a naive
+   hybrid (everything on v1 + an empty unified mount) leaves User Docker
+   detecting v1. The implemented split gives System Docker v1 and User
+   Docker real cgroup v2:
+   - PID1 (`pkg/dfs/scratch.go`) mounts on v1 only the controllers System
+     Docker 17.06 hard-requires: `devices` (its 2017 libcontainer fails every
+     container start without it; not a v2 controller anyway — v2 uses eBPF),
+     `freezer`, and the v1-only `net_cls`/`net_prio`/`perf_event`. All other
+     controllers (cpu, cpuacct, cpuset, memory, blkio, pids, hugetlb, rdma,
+     misc) stay unmounted on v1, which keeps them available on the **cgroup
+     v2 unified hierarchy** (mounted at `/sys/fs/cgroup/unified` on the
+     host). Verified against the 17.06 sources: libcontainer's fs manager
+     skips missing hierarchies (only devices is fatal) and containerd 0.2.x
+     merely logs the failed per-container OOM-monitor setup.
+   - `console_init.go` (`setupConsoleCgroups`): the user Docker daemon is
+     exec'd into the console mount namespace (`startDocker` in
+     `user_docker.go`), and Docker enables v2 mode only when
+     `/sys/fs/cgroup` itself is a cgroup2 mount. When the v2 hierarchy has
+     controllers, console-init mounts cgroup2 over `/sys/fs/cgroup` in the
+     console namespace, so **User Docker runs in cgroup v2 mode with working
+     resource limits** (cgroupfs driver — no systemd present). The host
+     namespace and System Docker are untouched. Without v2 controllers it
+     falls back to the old v1 + `name=systemd` layout.
+   - Kernel cmdline **`rancher.cgroups.legacy`** restores the all-v1 behavior
+     end-to-end (console auto-detects the empty v2 controller list).
+   - Accepted trade-offs: system containers get no cpu/memory limits, stats
+     or OOM events (they run unlimited by design; system-docker.log shows one
+     harmless OOM-monitor error per container; `system-docker stats` shows
+     no cpu/mem numbers). v1 hierarchy mount failures are non-fatal (logged).
+   - Kernel config note: with the split, the v1-only configs
+     (`CONFIG_MEMCG_V1` etc.) are needed just for the `rancher.cgroups.legacy`
+     fallback — keep them enabled in the 3.x kernel anyway.
+   - Boot-test checklist: `docker info` (user Docker) reports
+     `Cgroup Version: 2` + cgroupfs driver; `docker run --memory/--cpus`
+     limits take effect; Swarm works; all system containers start;
+     a `rancher.cgroups.legacy` boot still comes up like 2.x.
 3. **runc refresh under System Docker 17.06** (viable on the hybrid layout;
    candidate for 3.0 or early 3.x): keep dockerd 17.06 + containerd 0.2.x as
    the orchestrator but swap the `docker-runc`/`system-docker-runc` binary for

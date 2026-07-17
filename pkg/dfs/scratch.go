@@ -43,6 +43,32 @@ var (
 		{"none", "/sys/fs/cgroup", "tmpfs", ""},
 		{"debugfs", "/sys/kernel/debug", "debugfs", ""},
 	}
+
+	// Controllers kept on cgroup v1 hierarchies for System Docker 17.06.
+	// A controller can only be active on one hierarchy at a time, so every
+	// controller mounted on v1 is lost to the v2 unified hierarchy. This set
+	// is therefore kept minimal:
+	//   - devices: hard requirement of System Docker's 2017-era libcontainer
+	//     (a missing devices hierarchy fails every container start). It has
+	//     no cgroup v2 controller equivalent (v2 uses eBPF programs), so
+	//     keeping it on v1 costs the v2 side nothing.
+	//   - freezer: used for pause/kill; freezing is core cgroup v2
+	//     functionality (cgroup.freeze), not a controller, so no conflict.
+	//   - net_cls, net_prio, perf_event: never became v2 controllers.
+	// Everything else (cpu, cpuacct, cpuset, memory, blkio, pids, hugetlb,
+	// rdma, misc) is left unmounted on v1 so the kernel keeps it available
+	// on the cgroup v2 unified hierarchy for User Docker. System Docker
+	// tolerates these being absent: its libcontainer skips missing
+	// hierarchies (only devices is fatal) and containerd only logs the
+	// failed OOM-monitor setup. The cost is no resource limits/stats and no
+	// OOM events for system containers - they run unlimited anyway.
+	cgroupV1Controllers = map[string]bool{
+		"devices":    true,
+		"freezer":    true,
+		"net_cls":    true,
+		"net_prio":   true,
+		"perf_event": true,
+	}
 )
 
 type Config struct {
@@ -88,6 +114,17 @@ func createDirs(dirs ...string) error {
 	return nil
 }
 
+// cgroupsLegacyV1 reports whether the kernel command line requests the
+// pre-3.x behavior of mounting every controller on cgroup v1
+// (rancher.cgroups.legacy). The v2 hierarchy is then still mounted but has
+// no controllers, and the console keeps its v1 layout.
+func cgroupsLegacyV1() bool {
+	if v, ok := cmdline.GetCmdline("rancher.cgroups.legacy").(bool); ok {
+		return v
+	}
+	return false
+}
+
 func mountCgroups(hierarchyConfig map[string]string) error {
 	f, err := os.Open("/proc/cgroups")
 	if err != nil {
@@ -98,6 +135,7 @@ func mountCgroups(hierarchyConfig map[string]string) error {
 	scanner := bufio.NewScanner(f)
 
 	hierarchies := make(map[string][]string)
+	legacy := cgroupsLegacyV1()
 
 	for scanner.Scan() {
 		text := scanner.Text()
@@ -105,6 +143,11 @@ func mountCgroups(hierarchyConfig map[string]string) error {
 		fields := strings.Split(text, "\t")
 		cgroup := fields[0]
 		if cgroup == "" || cgroup[0] == '#' || (len(fields) > 3 && fields[3] == "0") {
+			continue
+		}
+
+		if !legacy && !cgroupV1Controllers[cgroup] {
+			log.Debugf("cgroup controller %s left to the v2 unified hierarchy", cgroup)
 			continue
 		}
 
