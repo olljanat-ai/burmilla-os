@@ -114,6 +114,32 @@ func GetMountFsType(target string) (string, error) {
 	return fsType, nil
 }
 
+// blkidTag returns the value of the KEY="value" tag from a single line of
+// blkid output. Only whole tag names match, so looking for TYPE does not
+// return the value of SEC_TYPE - blkid prints `SEC_TYPE="msdos"` before
+// `TYPE="vfat"` for FAT filesystems, and reporting a FAT32 EFI system
+// partition as "msdos" makes it get mounted without long file name support.
+func blkidTag(line, key string) string {
+	tag := key + `="`
+	for offset := 0; ; {
+		i := strings.Index(line[offset:], tag)
+		if i < 0 {
+			return ""
+		}
+		i += offset
+		offset = i + len(tag)
+		// the tag name has to start the line or follow a separator, otherwise
+		// we matched the tail of a longer tag name
+		if i != 0 && line[i-1] != ' ' {
+			continue
+		}
+		if end := strings.Index(line[offset:], `"`); end >= 0 {
+			return line[offset : offset+end]
+		}
+		return ""
+	}
+}
+
 func Blkid(label string) (deviceName, deviceType string, err error) {
 	// Not all blkid's have `blkid -L label (see busybox/alpine)
 	cmd := exec.Command("blkid")
@@ -126,15 +152,12 @@ func Blkid(label string) (deviceName, deviceType string, err error) {
 	s := bufio.NewScanner(r)
 	for s.Scan() {
 		line := s.Text()
-		if !strings.Contains(line, `LABEL="`+label+`"`) {
+		if blkidTag(line, "LABEL") != label {
 			continue
 		}
 		d := strings.Split(line, ":")
 		deviceName = d[0]
-
-		s1 := strings.Split(line, `TYPE="`)
-		s2 := strings.Split(s1[1], `"`)
-		deviceType = s2[0]
+		deviceType = blkidTag(line, "TYPE")
 		return
 	}
 	return
@@ -152,7 +175,7 @@ func BlkidType(deviceType string) (deviceNames []string, err error) {
 	s := bufio.NewScanner(r)
 	for s.Scan() {
 		line := s.Text()
-		if !strings.Contains(line, `TYPE="`+deviceType+`"`) {
+		if blkidTag(line, "TYPE") != deviceType {
 			continue
 		}
 		d := strings.Split(line, ":")

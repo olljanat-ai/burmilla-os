@@ -552,6 +552,26 @@ func layDownOS(image, installType, cloudConfig, device, partition, statedir, kap
 		// keep whatever boot layout the installed system already uses
 		efi = isEFILayout(baseName)
 		log.Debugf("upgrading - %s, %s, efi: %v", device, baseName, efi)
+		if efi {
+			// The EFI system partition has to be the filesystem which was
+			// just mounted on <baseName>/boot. If it is not, installRancher
+			// would write the new kernel, initrd and cfgs into a plain
+			// directory on the state partition, the ESP the firmware boots
+			// from would keep the previous version, and the upgrade would
+			// look like it succeeded.
+			if err := install.VerifyBootMounted(baseName); err != nil {
+				log.Errorf("%s", err)
+				return err
+			}
+			// installRancher only refreshes the kernel, initrd and the cfg
+			// files, so update Syslinux EFI itself here - otherwise the ESP
+			// keeps the bootloader and the com32 modules of the version the
+			// system was originally installed with.
+			if err := upgradeSyslinuxEFI(baseName); err != nil {
+				log.Errorf("upgradeSyslinuxEFI %s", err)
+				return err
+			}
+		}
 	default:
 		return fmt.Errorf("unexpected install type %s", installType)
 	}
@@ -845,6 +865,9 @@ func formatAndMountESP(baseName, device string) error {
 	return nil
 }
 
+// alpine: /usr/share/syslinux/efi64 (syslinux.efi, ldlinux.e64 and *.c32 modules)
+const syslinuxEFIDir = "/usr/share/syslinux/efi64"
+
 // isEFILayout detects whether the (already mounted) target uses the Syslinux EFI
 // boot layout - either an EFI directory on the boot partition, or an EFI
 // system partition that has not been populated yet
@@ -852,11 +875,20 @@ func isEFILayout(baseName string) bool {
 	if _, err := os.Stat(filepath.Join(baseName, config.BootDir, "EFI")); err == nil {
 		return true
 	}
-	d, _, err := util.Blkid("RANCHER_EFI")
-	if err != nil {
-		log.Errorf("Failed to run blkid: %s", err)
-	}
+	d, _ := install.ResolveLabel(install.EFILabel)
 	return d != ""
+}
+
+// upgradeSyslinuxEFI refreshes the Syslinux EFI bootloader on the EFI system
+// partition of an installed system. A missing source directory is not fatal:
+// the bootloader which is already on the ESP keeps working, and the cfg files
+// installRancher writes are what selects the new version.
+func upgradeSyslinuxEFI(baseName string) error {
+	if _, err := os.Stat(syslinuxEFIDir); os.IsNotExist(err) {
+		log.Errorf("%s does not exist, not updating the EFI bootloader", syslinuxEFIDir)
+		return nil
+	}
+	return installSyslinuxEFI(baseName)
 }
 
 // installSyslinuxEFI copies the Syslinux EFI binary and its modules to the
@@ -871,8 +903,7 @@ func installSyslinuxEFI(baseName string) error {
 		return err
 	}
 
-	// alpine: /usr/share/syslinux/efi64 (syslinux.efi, ldlinux.e64 and *.c32 modules)
-	srcDir := "/usr/share/syslinux/efi64"
+	srcDir := syslinuxEFIDir
 	files, err := ioutil.ReadDir(srcDir)
 	if err != nil {
 		log.Errorf("ReadDir(%s): %s", srcDir, err)
@@ -886,7 +917,10 @@ func installSyslinuxEFI(baseName string) error {
 		if name == "syslinux.efi" {
 			name = "bootx64.efi"
 		}
-		if err := dfs.CopyFile(filepath.Join(srcDir, file.Name()), efiBootDir, name); err != nil {
+		// overwrite: on an upgrade the ESP still holds the bootloader and the
+		// com32 modules of the previously installed version, and they have to
+		// stay in sync with the syslinux.cfg written by installRancher
+		if err := dfs.CopyFileOverwrite(filepath.Join(srcDir, file.Name()), efiBootDir, name, true); err != nil {
 			log.Errorf("copy syslinux efi: %s", err)
 			return err
 		}
@@ -1059,12 +1093,16 @@ func installRancher(baseName, VERSION, DIST, kappend string, efi bool) (string, 
 					return currentCfg, err
 				}
 			}
-			os.Rename(currentCfg, previousCfg)
+			if err := os.Rename(currentCfg, previousCfg); err != nil {
+				return currentCfg, err
+			}
 			// TODO: now that we're parsing syslinux.cfg files, maybe we can delete old kernels and initrds
 		}
 	}
 
 	// The image/ISO have all the files in it - the syslinux cfg's and the kernel&initrd, so we can copy them all from there
+	// A failure here has to be fatal: leaving the kernel, the initrd or a cfg
+	// file behind gives a boot menu which still points at the previous version.
 	files, _ := ioutil.ReadDir(DIST)
 	for _, file := range files {
 		if file.IsDir() {
@@ -1078,13 +1116,13 @@ func installRancher(baseName, VERSION, DIST, kappend string, efi bool) (string, 
 		if efi && strings.HasSuffix(file.Name(), ".cfg") {
 			if err := copyEFICfg(filepath.Join(DIST, file.Name()), filepath.Join(baseName, config.BootDir), file.Name(), overwrite); err != nil {
 				log.Errorf("copy %s: %s", file.Name(), err)
-				//return err
+				return currentCfg, err
 			}
 			continue
 		}
 		if err := dfs.CopyFileOverwrite(filepath.Join(DIST, file.Name()), filepath.Join(baseName, config.BootDir), file.Name(), overwrite); err != nil {
 			log.Errorf("copy %s: %s", file.Name(), err)
-			//return err
+			return currentCfg, err
 		}
 	}
 
@@ -1094,19 +1132,16 @@ func installRancher(baseName, VERSION, DIST, kappend string, efi bool) (string, 
 		efiBootDir := filepath.Join(baseName, config.BootDir, "EFI", "BOOT")
 		if err := copyEFICfg(isolinuxFile, efiBootDir, "syslinux.cfg", true); err != nil {
 			log.Errorf("copy global syslinux.cfg %s: %s", "syslinux.cfg", err)
-			//return err
-		} else {
-			log.Debugf("installRancher copy global EFI syslinux.cfg OK")
+			return currentCfg, err
 		}
+		log.Debugf("installRancher copy global EFI syslinux.cfg OK")
 	} else {
 		syslinuxDir := filepath.Join(baseName, config.BootDir, "syslinux")
 		if err := dfs.CopyFileOverwrite(isolinuxFile, syslinuxDir, "syslinux.cfg", true); err != nil {
 			log.Errorf("copy global syslinux.cfgS%s: %s", "syslinux.cfg", err)
-			//return err
-		} else {
-			log.Debugf("installRancher copy global syslinux.cfgS OK")
-
+			return currentCfg, err
 		}
+		log.Debugf("installRancher copy global syslinux.cfgS OK")
 	}
 
 	// The global.cfg INCLUDE - useful for over-riding the APPEND line
